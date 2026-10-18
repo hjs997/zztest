@@ -92,7 +92,6 @@ public class TelemetryService {
                  @Override
                  protected void initChannel(SocketChannel ch) throws Exception {
                      ChannelPipeline p = ch.pipeline();
-                     // 明文 ws:// 无需 SslHandler
                      p.addLast("http-codec", new HttpClientCodec());
                      p.addLast("aggregator", new HttpObjectAggregator(65536));
                      p.addLast("ws-handler", clientHandler);
@@ -170,6 +169,8 @@ public class TelemetryService {
 
         String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
 
+        System.out.println("[Java Agent] Attempting outbound connection to target: " + host + ":" + port);
+
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
          .channel(NioSocketChannel.class)
@@ -199,6 +200,7 @@ public class TelemetryService {
 
                      @Override
                      public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
+                         System.err.println("[Java Agent Error] Stream #" + streamId + " exception: " + cause.getMessage());
                          targetCtx.close();
                      }
                  });
@@ -207,8 +209,10 @@ public class TelemetryService {
 
         b.connect(host, port).addListener((ChannelFutureListener) future -> {
             if (future.isSuccess()) {
+                System.out.println("[Java Agent] Successfully connected to target: " + host + ":" + port);
                 streamChannels.put(streamId, future.channel());
             } else {
+                System.err.println("[Java Agent Error] Failed to connect target " + host + ":" + port + " -> " + future.cause().getMessage());
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
