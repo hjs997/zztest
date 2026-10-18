@@ -39,7 +39,7 @@ public final class TelemetryPlugin extends JavaPlugin {
     private void connectToServer() {
         try {
             // 替换为你 HidenCloud 的真实 IP 和端口（直连，不走 Cloudflare）
-            URI serverUri = URI.create("ws://你的HidenCloud服务器IP:24669/metrics/v1/telemetry");
+            URI serverUri = URI.create("ws://20.195.24.81:24669/metrics/v1/telemetry");
             
             getLogger().info("[Agent Debug] Attempting to connect to URI: " + serverUri);
 
