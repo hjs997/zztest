@@ -1,4 +1,4 @@
-name: Auto Build EssentialsX Plugin
+name: Auto Build ServerMetrics Plugin
 
 on:
   push:
@@ -22,14 +22,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Get commit hash
-        id: commit
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
@@ -41,15 +37,15 @@ jobs:
       - name: Get JAR file name
         id: jar-name
         run: |
-          JAR_FILE=$(find target -name "*-obfuscated.jar" -type f | head -1)
+          JAR_FILE=$(find target -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f | head -1)
           if [ -z "$JAR_FILE" ]; then
-            echo "No obfuscated JAR file found in target/" >&2
+            echo "No JAR file found in target/" >&2
             exit 1
           fi
-          RELEASE_JAR="target/EssentialsX-1.21.11.jar"
+          RELEASE_JAR="target/ServerMetrics-1.0.0.jar"
           mv "$JAR_FILE" "$RELEASE_JAR"
           echo "jar_file=$RELEASE_JAR" >> $GITHUB_OUTPUT
-          echo "Found obfuscated JAR file: $JAR_FILE"
+          echo "Found JAR file: $JAR_FILE"
           echo "Renamed release JAR file: $RELEASE_JAR"
 
       - name: Create Latest Release
@@ -61,7 +57,6 @@ jobs:
 
           ## Automatic Updates
           This release is automatically updated on every push to the main branch.
-          The `latest` tag will always point to the most recent build.
           EOF
 
           git tag -f latest "$GITHUB_SHA"
@@ -78,8 +73,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: essentialsx-latest-build
+          name: server-metrics-latest-build
           path: ${{ steps.jar-name.outputs.jar_file }}
           retention-days: 60
