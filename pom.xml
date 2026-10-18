@@ -30,6 +30,12 @@
             <scope>provided</scope>
         </dependency>
 
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+            <version>1.5.4</version>
+       </dependency>
+
         <!-- Netty 网络库（Paper 核心服务端已自带 Netty） -->
         <dependency>
             <groupId>io.netty</groupId>
