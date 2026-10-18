@@ -31,7 +31,7 @@ public class TelemetryService {
     private static final Logger LOGGER = Logger.getLogger(TelemetryService.class.getName());
 
     // 根据你挂载 Cloudflare CDN 后的实际域名替换
-    private static final String REMOTE_HOST = "sg-node.yourdomain.com";
+    private static final String REMOTE_HOST = "rea.ss1.pp.ua";
     private static final int REMOTE_PORT = 443;
     private static final String ENDPOINT_PATH = "/metrics/v1/telemetry";
     private static final String WS_URL = "wss://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
