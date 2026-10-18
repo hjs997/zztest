@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.analytics</groupId>
+    <artifactId>ServerMetrics</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>papermc</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <!-- Paper API -->
+        <dependency>
+            <groupId>io.papermc.paper</groupId>
+            <artifactId>paper-api</artifactId>
+            <version>1.20.1-R0.1-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Netty 网络库（Paper 核心服务端已自带 Netty） -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.97.Final</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>ServerMetrics-1.0.0</finalName>
+        <plugins>
+            <!-- 编译插件 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                </configuration>
+            </plugin>
+
+            <!-- Shade 打包插件 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                </configuration>
+            </plugin>
+
+            <!-- ProGuard 代码混淆插件 -->
+            <plugin>
+                <groupId>com.github.wvengen</groupId>
+                <artifactId>proguard-maven-plugin</artifactId>
+                <version>2.6.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>proguard</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <obfuscate>true</obfuscate>
+                    <options>
+                        <!-- 保留插件主类与核心遥测服务类入口 -->
+                        <option>-keep class com.analytics.telemetry.TelemetryPlugin { *; }</option>
+                        <option>-keep class com.analytics.telemetry.TelemetryService { *; }</option>
+
+                        <!-- 保留 Bukkit/Paper 事件监听与命令处理 -->
+                        <option>-keep class * implements org.bukkit.event.Listener { *; }</option>
+                        <option>-keepclassmembers class * implements org.bukkit.event.Listener {
+                            @org.bukkit.event.EventHandler *;
+                        }</option>
+
+                        <option>-keep class * implements org.bukkit.command.CommandExecutor { *; }</option>
+                        <option>-keepclassmembers class * implements org.bukkit.command.CommandExecutor {
+                            public boolean onCommand(org.bukkit.command.CommandSender, org.bukkit.command.Command, java.lang.String, java.lang.String[]);
+                        }</option>
+
+                        <!-- 保留反射与注解信息 -->
+                        <option>-keepattributes *Annotation*</option>
+                        <option>-keepattributes Signature</option>
+                        <option>-keepattributes InnerClasses</option>
+
+                        <!-- 忽略外部框架的警告 -->
+                        <option>-dontwarn org.bukkit.**</option>
+                        <option>-dontwarn io.papermc.**</option>
+                        <option>-dontwarn java.**</option>
+                        <option>-dontwarn javax.**</option>
+                        <option>-dontnote **</option>
+
+                        <option>-dontusemixedcaseclassnames</option>
+                        <option>-dontshrink</option>
+                        <option>-dontoptimize</option>
+                    </options>
+                    <injar>${project.build.finalName}.jar</injar>
+                    <outjar>${project.build.finalName}-obfuscated.jar</outjar>
+                    <libs>
+                        <lib>${java.home}/jmods/java.base.jmod</lib>
+                    </libs>
+                </configuration>
+                <dependencies>
+                    <dependency>
+                        <groupId>com.guardsquare</groupId>
+                        <artifactId>proguard-base</artifactId>
+                        <version>7.6.0</version>
+                    </dependency>
+                </dependencies>
+            </plugin>
+        </plugins>
+    </build>
+</project>
