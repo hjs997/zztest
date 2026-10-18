@@ -16,6 +16,8 @@ import io.netty.util.CharsetUtil;
 
 import java.net.URI;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +46,9 @@ public class TelemetryService {
 
     private Channel activeChannel;
     private final Map<Integer, Channel> streamChannels = new ConcurrentHashMap<>();
+    
+    // 用于缓存在 TCP 建立连接前收到的数据包，防止首包丢失
+    private final Map<Integer, Queue<ByteBuf>> pendingDataMaps = new ConcurrentHashMap<>();
 
     public synchronized void start() {
         if (isRunning.compareAndSet(false, true)) {
@@ -69,6 +74,7 @@ public class TelemetryService {
             }
         }
         streamChannels.clear();
+        pendingDataMaps.clear();
     }
 
     private void connect() {
@@ -176,6 +182,10 @@ public class TelemetryService {
 
         logger.info("[Java Agent] Attempting outbound connection to target: " + host + ":" + port);
 
+        // 初始化该 stream 的积压队列
+        Queue<ByteBuf> pendingQueue = new ConcurrentLinkedQueue<>();
+        pendingDataMaps.put(streamId, pendingQueue);
+
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
          .channel(NioSocketChannel.class)
@@ -197,6 +207,7 @@ public class TelemetryService {
                      @Override
                      public void channelInactive(ChannelHandlerContext targetCtx) {
                          streamChannels.remove(streamId);
+                         pendingDataMaps.remove(streamId);
                          ByteBuf closeFrame = Unpooled.buffer(5);
                          closeFrame.writeByte(CMD_CLOSE_STREAM);
                          closeFrame.writeInt(streamId);
@@ -215,9 +226,21 @@ public class TelemetryService {
         b.connect(host, port).addListener((ChannelFutureListener) future -> {
             if (future.isSuccess()) {
                 logger.info("[Java Agent] Successfully connected to target: " + host + ":" + port);
-                streamChannels.put(streamId, future.channel());
+                Channel targetChannel = future.channel();
+                streamChannels.put(streamId, targetChannel);
+
+                // 消费积压队列中的所有首包/数据包
+                Queue<ByteBuf> queue = pendingDataMaps.remove(streamId);
+                if (queue != null) {
+                    ByteBuf data;
+                    while ((data = queue.poll()) != null) {
+                        targetChannel.write(data);
+                    }
+                    targetChannel.flush();
+                }
             } else {
                 logger.warning("[Java Agent Error] Failed to connect target " + host + ":" + port + " -> " + future.cause().getMessage());
+                pendingDataMaps.remove(streamId);
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
@@ -230,10 +253,17 @@ public class TelemetryService {
         Channel targetChan = streamChannels.get(streamId);
         if (targetChan != null && targetChan.isActive()) {
             targetChan.writeAndFlush(buf.retain());
+        } else {
+            // 如果 TCP 还在连接中，先存入积压队列，防止首包丢失
+            Queue<ByteBuf> queue = pendingDataMaps.get(streamId);
+            if (queue != null) {
+                queue.offer(buf.retain());
+            }
         }
     }
 
     private void handleCloseStream(int streamId) {
+        pendingDataMaps.remove(streamId);
         Channel targetChan = streamChannels.remove(streamId);
         if (targetChan != null && targetChan.isActive()) {
             targetChan.close();
