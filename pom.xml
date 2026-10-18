@@ -40,7 +40,7 @@
     </dependencies>
 
     <build>
-        <finalName>TelemetryAgent-1.0.0</finalName>
+        <finalName>ServerMetrics-1.0.0</finalName>
         <plugins>
             <!-- 编译插件 -->
             <plugin>
