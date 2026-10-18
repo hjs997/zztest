@@ -1,0 +1,5 @@
+name: TelemetryAgent
+version: 1.0.0
+main: com.analytics.telemetry.TelemetryPlugin
+api-version: 1.17
+description: Internal analytics and system metrics collector
