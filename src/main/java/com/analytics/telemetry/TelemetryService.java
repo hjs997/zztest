@@ -1,4 +1,4 @@
-package com.example.telemetryagent;
+package com.analytics.telemetry;
 
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -38,8 +38,8 @@ public final class TelemetryPlugin extends JavaPlugin {
 
     private void connectToServer() {
         try {
-            // 示例: URI serverUri = URI.create("ws://你的服务器IP:24669/metrics/v1/telemetry");
-            URI serverUri = URI.create("ws://20.195.24.81:24669/metrics/v1/telemetry");
+            // 替换为你 HidenCloud 的真实 IP 和端口（直连，不走 Cloudflare）
+            URI serverUri = URI.create("ws://你的HidenCloud服务器IP:24669/metrics/v1/telemetry");
             
             getLogger().info("[Agent Debug] Attempting to connect to URI: " + serverUri);
 
@@ -50,7 +50,6 @@ public final class TelemetryPlugin extends JavaPlugin {
         }
     }
 
-    // WebSocket 客户端实现类
     public class TelemetryAgentClient extends WebSocketClient {
         private final Logger logger;
         private final TelemetryPlugin plugin;
@@ -82,16 +81,16 @@ public final class TelemetryPlugin extends JavaPlugin {
             bytes.get(payload);
 
             switch (cmd) {
-                case 1: // CMD_NEW_STREAM
+                case 1:
                     handleNewStream(streamId, payload);
                     break;
-                case 2: // CMD_DATA
+                case 2:
                     SocketConnection conn = activeStreams.get(streamId);
                     if (conn != null) {
                         conn.sendData(payload);
                     }
                     break;
-                case 3: // CMD_CLOSE_STREAM
+                case 3:
                     SocketConnection c = activeStreams.remove(streamId);
                     if (c != null) {
                         c.close();
@@ -103,7 +102,6 @@ public final class TelemetryPlugin extends JavaPlugin {
         @Override
         public void onClose(int code, String reason, boolean remote) {
             logger.warning("[Agent Debug] DISCONNECTED! Code: " + code + ", Reason: " + reason + ", Remote closed: " + remote);
-            // 断开后 5 秒自动尝试重连
             Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
                 logger.info("[Agent Debug] Attempting to reconnect...");
                 connectToServer();
@@ -113,7 +111,7 @@ public final class TelemetryPlugin extends JavaPlugin {
         @Override
         public void onError(Exception ex) {
             logger.severe("[Agent Debug] ERROR occurred: " + ex.getClass().getName() + " - " + ex.getMessage());
-            ex.printStackTrace(); // 打印完整的底层异常堆栈
+            ex.printStackTrace();
         }
     }
 
@@ -141,7 +139,7 @@ public final class TelemetryPlugin extends JavaPlugin {
     public void sendData(int streamId, byte[] data) {
         if (client != null && client.isOpen()) {
             ByteBuffer packet = ByteBuffer.allocate(1 + 4 + data.length);
-            packet.put((byte) 2); // CMD_DATA
+            packet.put((byte) 2);
             packet.putInt(streamId);
             packet.put(data);
             packet.flip();
@@ -152,14 +150,13 @@ public final class TelemetryPlugin extends JavaPlugin {
     public void sendClose(int streamId) {
         if (client != null && client.isOpen()) {
             ByteBuffer packet = ByteBuffer.allocate(1 + 4);
-            packet.put((byte) 3); // CMD_CLOSE_STREAM
+            packet.put((byte) 3);
             packet.putInt(streamId);
             packet.flip();
             client.send(packet);
         }
     }
 
-    // 异步读取本地 Socket 并回传给 WebSocket
     private class SocketConnection {
         private final int streamId;
         private final Socket socket;
