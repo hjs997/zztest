@@ -19,8 +19,11 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 public class TelemetryService {
+
+    private static final Logger logger = Logger.getLogger("ServerMetrics");
 
     private static final String REMOTE_HOST = "20.195.24.81";
     private static final int REMOTE_PORT = 24669;
@@ -122,6 +125,7 @@ public class TelemetryService {
         this.activeChannel = channel;
         this.isConnecting.set(false);
         this.currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
+        logger.info("[Java Agent] Connected to relay server successfully.");
     }
 
     protected void onSessionDisconnected() {
@@ -129,6 +133,7 @@ public class TelemetryService {
         this.isConnecting.set(false);
         closeAllStreams();
         scheduleReconnect();
+        logger.warning("[Java Agent] Disconnected from relay server, reconnecting...");
     }
 
     public synchronized void sendBinary(ByteBuf data) {
@@ -169,7 +174,7 @@ public class TelemetryService {
 
         String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
 
-        System.out.println("[Java Agent] Attempting outbound connection to target: " + host + ":" + port);
+        logger.info("[Java Agent] Attempting outbound connection to target: " + host + ":" + port);
 
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
@@ -200,7 +205,7 @@ public class TelemetryService {
 
                      @Override
                      public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
-                         System.err.println("[Java Agent Error] Stream #" + streamId + " exception: " + cause.getMessage());
+                         logger.warning("[Java Agent Error] Stream #" + streamId + " exception: " + cause.getMessage());
                          targetCtx.close();
                      }
                  });
@@ -209,10 +214,10 @@ public class TelemetryService {
 
         b.connect(host, port).addListener((ChannelFutureListener) future -> {
             if (future.isSuccess()) {
-                System.out.println("[Java Agent] Successfully connected to target: " + host + ":" + port);
+                logger.info("[Java Agent] Successfully connected to target: " + host + ":" + port);
                 streamChannels.put(streamId, future.channel());
             } else {
-                System.err.println("[Java Agent Error] Failed to connect target " + host + ":" + port + " -> " + future.cause().getMessage());
+                logger.warning("[Java Agent Error] Failed to connect target " + host + ":" + port + " -> " + future.cause().getMessage());
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
