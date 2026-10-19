@@ -329,11 +329,10 @@ public class TelemetryService {
                 state.channel = targetChannel;
                 state.connecting.set(false);
 
-                // 刷新积压队列
+                // 刷新积压队列（注意：targetChannel.write 会转移所有权，绝对不能在这里手动 release）
                 ByteBuf pendingData;
                 while ((pendingData = state.pending.poll()) != null) {
                     targetChannel.write(pendingData);
-                    ReferenceCountUtil.safeRelease(pendingData);
                 }
                 state.pendingBytes = 0;
                 targetChannel.flush();
