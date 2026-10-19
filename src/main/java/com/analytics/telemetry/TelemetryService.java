@@ -13,12 +13,14 @@ import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.websocketx.*;
 import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
 
 import java.net.URI;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -37,13 +39,19 @@ public class TelemetryService {
     private static final int MAX_RECONNECT_DELAY_SEC = 60;
     private int currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
 
-    private final EventLoopGroup workerGroup = new NioEventLoopGroup();
+    private final EventLoopGroup workerGroup = new NioEventLoopGroup(2);
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private final AtomicBoolean isConnecting = new AtomicBoolean(false);
 
     private Channel activeChannel;
+    private ScheduledFuture<?> heartbeatFuture;
+    private long lastPongTime = 0;
+
     private final Map<Integer, Channel> streamChannels = new ConcurrentHashMap<>();
     private final Map<Integer, Queue<ByteBuf>> pendingDataMaps = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> pendingBytesCount = new ConcurrentHashMap<>();
+
+    private static final int MAX_PENDING_BYTES_PER_STREAM = 64 * 1024; // 64KB 限额防止内存泄漏
 
     public synchronized void start() {
         if (isRunning.compareAndSet(false, true)) {
@@ -53,11 +61,25 @@ public class TelemetryService {
 
     public synchronized void stop() {
         if (isRunning.compareAndSet(true, false)) {
-            closeAllStreams();
-            if (activeChannel != null) {
-                activeChannel.close();
-            }
+            cleanupAll();
             workerGroup.shutdownGracefully();
+        }
+    }
+
+    private synchronized void cleanupAll() {
+        cancelHeartbeat();
+        closeAllStreams();
+        if (activeChannel != null) {
+            activeChannel.close();
+            activeChannel = null;
+        }
+        isConnecting.set(false);
+    }
+
+    private void cancelHeartbeat() {
+        if (heartbeatFuture != null) {
+            heartbeatFuture.cancel(true);
+            heartbeatFuture = null;
         }
     }
 
@@ -69,10 +91,20 @@ public class TelemetryService {
             }
         }
         streamChannels.clear();
+        
+        // 彻底释放积压队列中的 ByteBuf，防止堆外内存泄漏
+        for (Map.Entry<Integer, Queue<ByteBuf>> entry : pendingDataMaps.entrySet()) {
+            Queue<ByteBuf> queue = entry.getValue();
+            ByteBuf buf;
+            while ((buf = queue.poll()) != null) {
+                ReferenceCountUtil.safeRelease(buf);
+            }
+        }
         pendingDataMaps.clear();
+        pendingBytesCount.clear();
     }
 
-    private void connect() {
+    private synchronized void connect() {
         if (!isRunning.get() || isConnecting.get()) return;
         if (activeChannel != null && activeChannel.isActive()) return;
 
@@ -80,7 +112,6 @@ public class TelemetryService {
 
         try {
             final URI uri = new URI(WS_URL);
-
             final WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                     uri, WebSocketVersion.V13, null, true, new DefaultHttpHeaders(), 65536 * 10
             );
@@ -94,7 +125,7 @@ public class TelemetryService {
              .option(ChannelOption.SO_KEEPALIVE, true)
              .handler(new ChannelInitializer<SocketChannel>() {
                  @Override
-                 protected void initChannel(SocketChannel ch) throws Exception {
+                 protected void initChannel(SocketChannel ch) {
                      ChannelPipeline p = ch.pipeline();
                      p.addLast("http-codec", new HttpClientCodec());
                      p.addLast("aggregator", new HttpObjectAggregator(65536));
@@ -122,24 +153,44 @@ public class TelemetryService {
         workerGroup.schedule(this::connect, delay, TimeUnit.SECONDS);
     }
 
-    protected void onSessionConnected(Channel channel) {
+    protected synchronized void onSessionConnected(Channel channel) {
         this.activeChannel = channel;
         this.isConnecting.set(false);
         this.currentReconnectDelaySec = INITIAL_RECONNECT_DELAY_SEC;
+        this.lastPongTime = System.currentTimeMillis();
+
+        cancelHeartbeat();
+        // 25秒心跳 + 超时检测机制
+        heartbeatFuture = workerGroup.scheduleAtFixedRate(() -> {
+            if (activeChannel != null && activeChannel.isActive()) {
+                // 如果超过 50 秒没有收到 Pong 响应，判定连接假死，主动断开触发重连
+                if (System.currentTimeMillis() - lastPongTime > 50000) {
+                    activeChannel.close();
+                    return;
+                }
+                activeChannel.writeAndFlush(new PingWebSocketFrame());
+            }
+        }, 25, 25, TimeUnit.SECONDS);
     }
 
-    protected void onSessionDisconnected() {
+    protected synchronized void onSessionDisconnected() {
+        if (!isRunning.get()) return;
+        cancelHeartbeat();
         this.activeChannel = null;
         this.isConnecting.set(false);
         closeAllStreams();
         scheduleReconnect();
     }
 
+    protected synchronized void updatePongTime() {
+        this.lastPongTime = System.currentTimeMillis();
+    }
+
     public synchronized void sendBinary(ByteBuf data) {
         if (activeChannel != null && activeChannel.isActive()) {
             activeChannel.writeAndFlush(new BinaryWebSocketFrame(data));
         } else {
-            data.release();
+            ReferenceCountUtil.safeRelease(data);
         }
     }
 
@@ -173,8 +224,10 @@ public class TelemetryService {
 
         String host = buf.readCharSequence(hostLen, CharsetUtil.UTF_8).toString();
 
+        // 严格隔离初始化
         Queue<ByteBuf> pendingQueue = new ConcurrentLinkedQueue<>();
         pendingDataMaps.put(streamId, pendingQueue);
+        pendingBytesCount.put(streamId, 0);
 
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
@@ -196,12 +249,7 @@ public class TelemetryService {
 
                      @Override
                      public void channelInactive(ChannelHandlerContext targetCtx) {
-                         streamChannels.remove(streamId);
-                         pendingDataMaps.remove(streamId);
-                         ByteBuf closeFrame = Unpooled.buffer(5);
-                         closeFrame.writeByte(CMD_CLOSE_STREAM);
-                         closeFrame.writeInt(streamId);
-                         sendBinary(closeFrame);
+                         terminateStream(streamId);
                      }
 
                      @Override
@@ -217,16 +265,19 @@ public class TelemetryService {
                 Channel targetChannel = future.channel();
                 streamChannels.put(streamId, targetChannel);
 
+                // 消费积压队列并保证严格的引用计数释放
                 Queue<ByteBuf> queue = pendingDataMaps.remove(streamId);
+                pendingBytesCount.remove(streamId);
                 if (queue != null) {
                     ByteBuf data;
                     while ((data = queue.poll()) != null) {
                         targetChannel.write(data);
+                        ReferenceCountUtil.release(data);
                     }
                     targetChannel.flush();
                 }
             } else {
-                pendingDataMaps.remove(streamId);
+                terminateStream(streamId);
                 ByteBuf closeFrame = Unpooled.buffer(5);
                 closeFrame.writeByte(CMD_CLOSE_STREAM);
                 closeFrame.writeInt(streamId);
@@ -238,20 +289,48 @@ public class TelemetryService {
     private void handleDataPayload(int streamId, ByteBuf buf) {
         Channel targetChan = streamChannels.get(streamId);
         if (targetChan != null && targetChan.isActive()) {
-            targetChan.writeAndFlush(buf.retain());
+            // Netty 背压感知：通道不可写时暂停处理防止内存溢出
+            if (targetChan.isWritable()) {
+                targetChan.writeAndFlush(buf.retain());
+            } else {
+                // 如果对端写满，直接丢弃并释放以防崩溃
+                ReferenceCountUtil.safeRelease(buf);
+            }
         } else {
+            // TCP 未就绪，暂存进积压队列并进行严格的内存限额控制
             Queue<ByteBuf> queue = pendingDataMaps.get(streamId);
             if (queue != null) {
-                queue.offer(buf.retain());
+                Integer currentBytes = pendingBytesCount.get(streamId);
+                if (currentBytes != null && currentBytes + buf.readableBytes() <= MAX_PENDING_BYTES_PER_STREAM) {
+                    queue.offer(buf.retain());
+                    pendingBytesCount.put(streamId, currentBytes + buf.readableBytes());
+                } else {
+                    // 超过限额，静默丢弃防止内存泄漏
+                    ReferenceCountUtil.safeRelease(buf);
+                }
+            } else {
+                ReferenceCountUtil.safeRelease(buf);
             }
         }
     }
 
     private void handleCloseStream(int streamId) {
-        pendingDataMaps.remove(streamId);
+        terminateStream(streamId);
+    }
+
+    private void terminateStream(int streamId) {
         Channel targetChan = streamChannels.remove(streamId);
         if (targetChan != null && targetChan.isActive()) {
             targetChan.close();
+        }
+        
+        Queue<ByteBuf> queue = pendingDataMaps.remove(streamId);
+        pendingBytesCount.remove(streamId);
+        if (queue != null) {
+            ByteBuf buf;
+            while ((buf = queue.poll()) != null) {
+                ReferenceCountUtil.safeRelease(buf);
+            }
         }
     }
 
@@ -273,9 +352,11 @@ public class TelemetryService {
         protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
             Channel ch = ctx.channel();
             if (!handshaker.isHandshakeComplete()) {
-                handshaker.finishHandshake(ch, (FullHttpResponse) msg);
-                handshakerFuture.setSuccess();
-                service.onSessionConnected(ch);
+                if (msg instanceof FullHttpResponse) {
+                    handshaker.finishHandshake(ch, (FullHttpResponse) msg);
+                    handshakerFuture.setSuccess();
+                    service.onSessionConnected(ch);
+                }
                 return;
             }
 
@@ -285,6 +366,8 @@ public class TelemetryService {
                     service.handleInboundBinaryFrame(ctx, frame.content());
                 } else if (frame instanceof PingWebSocketFrame) {
                     ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
+                } else if (frame instanceof PongWebSocketFrame) {
+                    service.updatePongTime();
                 } else if (frame instanceof CloseWebSocketFrame) {
                     ch.close();
                 }
