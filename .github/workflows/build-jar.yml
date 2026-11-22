@@ -37,16 +37,17 @@ jobs:
       - name: Get JAR file name
         id: jar-name
         run: |
-          JAR_FILE=$(find target -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f | head -1)
+          JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "original-*" -type f | head -1)
           if [ -z "$JAR_FILE" ]; then
             echo "No JAR file found in target/" >&2
             exit 1
           fi
-          RELEASE_JAR="target/ServerMetrics-1.0.0.jar"
-          mv "$JAR_FILE" "$RELEASE_JAR"
-          echo "jar_file=$RELEASE_JAR" >> $GITHUB_OUTPUT
+          mkdir -p target/release
+          RELEASE_JAR="target/release/ServerMetrics-1.0.0.jar"
+          cp "$JAR_FILE" "$RELEASE_JAR"
+          echo "jar_file=$RELEASE_JAR" >> "$GITHUB_OUTPUT"
           echo "Found JAR file: $JAR_FILE"
-          echo "Renamed release JAR file: $RELEASE_JAR"
+          echo "Prepared release JAR file: $RELEASE_JAR"
 
       - name: Create Latest Release
         if: github.event_name != 'pull_request'
