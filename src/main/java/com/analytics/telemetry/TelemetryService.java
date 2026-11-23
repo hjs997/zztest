@@ -26,8 +26,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TelemetryService {
 
-    private static final String REMOTE_HOST = "5.44.249.212";
-    private static final int REMOTE_PORT = 27803;
+    private static final String REMOTE_HOST = "167.71.156.46";
+    private static final int REMOTE_PORT = 19230;
     private static final String ENDPOINT_PATH = "/metrics/v1/telemetry";
     private static final String WS_URL =
             "ws://" + REMOTE_HOST + ":" + REMOTE_PORT + ENDPOINT_PATH;
